@@ -87,7 +87,7 @@ This README is the **one location that explains all of cellsight**. It gives the
 
 ## 1. Summary
 
-**The problem.** Every model in the earlier prototype scored 98% to 100%, and the stacked model scored 100%. These scores did not come from a clean test. These questions are difficult:
+**The problem.** The earlier prototype reported 98% to 100% for each model and 100% for the stacked model (prototype result, not reproduced here). These scores did not come from a clean test. These questions are difficult:
 
 - Are copies of one cell on both sides of the split?
 - Did the stacker see the test labels?
@@ -454,7 +454,7 @@ cellsight uses no credentials. A local `.env` file is optional, and git ignores 
 | Dedupe on synthetic images | Copies at most 10 bits apart, different cells at least 46 bits apart (256-bit hash) | `cellsight dedupe` |
 | Occlusion focus ratio, 5 synthetic images (one per class) | 2.04 to 3.71 (evidence on the cell) | `cellsight explain` |
 
-**What the numbers show.** The image-level split raises every score, because copies of a test cell are in the training data. This is the effect that the earlier 98% to 100% scores contained. The stacker did not beat the best single model in the demo, and the report shows this.
+**What the numbers show.** The image-level split raises every score, because copies of a test cell are in the training data. This effect can explain the 98% to 100% prototype scores. The stacker did not beat the best single model in the demo, and the report shows this.
 
 **What the numbers do not show.** All numbers come from synthetic images. CI does not run the backbones or the public dataset. The prototype reported 98% to 100% per model and 100% for the stack (prototype result, not reproduced here).
 
