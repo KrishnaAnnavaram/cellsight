@@ -1,0 +1,23 @@
+{
+  "training": {
+    "max_epochs": 20,
+    "patience": 4,
+    "batch_size": 32,
+    "lr_head": 0.001,
+    "lr_full": 0.0001,
+    "weight_decay": 0.0001,
+    "freeze_epochs": 3,
+    "val_fraction": 0.15,
+    "amp": true,
+    "selection_metric": "macro_f1"
+  },
+  "backbones": {
+    "vgg19_bn": {"timm_name": "vgg19_bn.tv_in1k", "target_layer": "features"},
+    "densenet201": {"timm_name": "densenet201.tv_in1k", "target_layer": "features"},
+    "resnet50": {"timm_name": "resnet50.tv_in1k", "target_layer": "layer4"},
+    "inception_v3": {"timm_name": "inception_v3.tv_in1k", "target_layer": "Mixed_7c"},
+    "vit_b16": {"timm_name": "vit_base_patch16_224.augreg_in21k_ft_in1k", "target_layer": "blocks.11.norm1"},
+    "efficientnet_b3": {"timm_name": "efficientnet_b3.ra2_in1k", "target_layer": "conv_head"},
+    "swin_b": {"timm_name": "swin_base_patch4_window7_224.ms_in22k_ft_in1k", "target_layer": "layers.3", "channels_last": true}
+  }
+}
