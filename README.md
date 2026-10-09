@@ -69,6 +69,7 @@ This README is the **one location that explains all of cellsight**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one image](#42-the-life-cycle-of-one-image)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The image index and the dedupe step](#5-the-image-index-and-the-dedupe-step)
 6. 🟢 [The base models](#6-the-base-models)
 7. 🟣 [Out-of-fold stacking and the explanations](#7-out-of-fold-stacking-and-the-explanations)
@@ -134,6 +135,53 @@ flowchart LR
 | Report | `src/cellsight/report.py` | `report.md` and `results.json` |
 | CLI | `src/cellsight/cli.py` | The `cellsight` command with 8 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>cellsight command"]
+    CFG["config.py<br/>Settings"]
+    subgraph DATA["Images and groups"]
+        SYN["synthetic.py<br/>generate"]
+        DS["dataset.py<br/>scan, Manifest, load_image"]
+        DD["dedupe.py<br/>assign_groups"]
+        SP["splits.py<br/>holdout_split, kfold"]
+    end
+    subgraph MODELS["Models"]
+        MOD["models.py<br/>make_model, LightModel, FeatureCache"]
+        FEAT["features.py<br/>image_features"]
+        DEEP["deep.py<br/>TorchModel, extra deep"]
+    end
+    subgraph EVAL["Ensemble and results"]
+        ENS["ensemble.py<br/>run, Stacker, Bundle"]
+        REP["report.py<br/>evaluate, write"]
+        MET["metrics.py<br/>point_metrics, bootstrap"]
+        EXP["explain.py<br/>occlusion_map, focus_ratio"]
+    end
+    CLS["classes.py<br/>CLASSES, CRITICAL_CLASS"]
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DS
+    CLI --> DD
+    CLI --> SP
+    CLI --> ENS
+    CLI --> REP
+    CLI --> EXP
+    CLI --> DEEP
+    DD --> DS
+    ENS --> SP
+    ENS --> MOD
+    MOD --> FEAT
+    MOD --> DEEP
+    FEAT --> DS
+    DEEP --> DS
+    REP --> ENS
+    REP --> MET
+    MET --> CLS
+    DS --> CLS
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -170,6 +218,19 @@ cellsight/
 ### 3.2 Copies of one cell stay on one side
 `dedupe.assign_groups` links images whose 256-bit perceptual hash is within `CELLSIGHT_HASH_DISTANCE` bits, for any of 8 rotations and flips. Byte-identical files share a group. Slide groups from `metadata.csv` and duplicate groups merge into split groups.
 
+```mermaid
+flowchart LR
+    A[/"Cell A"/] --> C1["Copy A1:<br/>rotation"]
+    A --> C2["Copy A2:<br/>flip, brightness"]
+    C1 --> IMG{"--split-by"}
+    C2 --> IMG
+    IMG -- "image (leakage check)" --> X["A1 in development,<br/>A2 in test"]
+    X --> INF[/"Inflated test score"/]
+    IMG -- "group (default)" --> G["assign_groups: A, A1, A2<br/>in one split group"]
+    G --> SAME["The whole group in<br/>development or in test"]
+    SAME --> HON[/"Honest test score"/]
+```
+
 ### 3.3 Each backbone gets its own preprocessing
 `deep.build_network` reads the input size, mean and standard deviation from the timm data config of each backbone. `deep.preprocess` applies them to every image. A test checks the normalised pixel values.
 
@@ -195,9 +256,10 @@ The manifest keeps paths, not pixels. The feature cache keeps one 108-value vect
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
+flowchart TD
+    IMGS[/"image folder: one subfolder per class"/] --> SCAN
     SCAN["scan: manifest, validation, SHA-256"] --> DD["dedupe: 8 hashes per image, union-find"]
-    META["metadata.csv (optional slide groups)"] --> DD
+    META[/"metadata.csv (optional slide groups)"/] --> DD
     DD --> HS["holdout_split: development images + test set"]
     HS --> KF["kfold on development images (group-aware)"]
     KF --> OOF["each base model: fit on k-1 folds, predict the held-out fold"]
@@ -206,13 +268,49 @@ flowchart TB
     RF --> TP["single test pass: base models, mean, stack"]
     ST --> TP
     TP --> MET["metrics + group bootstrap CIs"]
-    MET --> REP["report.md + results.json"]
-    RF --> BUN["bundle (.joblib)"]
+    MET --> REP[/"report.md + results.json"/]
+    RF --> SAVE{"--save-model and<br/>light models only?"}
+    SAVE -- "yes" --> BUN[("bundle (.joblib)")]
     BUN --> EXP["explain: occlusion map + focus ratio"]
     BUN --> PRED["predict new images"]
+    NEW[/"new images"/] --> PRED
+    PRED --> OUTP[/"prediction and confidence"/]
+    EXP --> OUTE[/"overlay PNG, focus ratio"/]
+    REP --> HUMAN{{"HUMAN<br/>a qualified person reviews every result"}}
+    OUTP --> HUMAN
+    OUTE --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one image
+
+```mermaid
+stateDiagram-v2
+    state "File in a class folder" as File
+    state "Manifest row: path, label, sha256, group" as Indexed
+    state "dup_group and split_group" as Grouped
+    state "Development image" as Dev
+    state "Test image" as Test
+    state "OOF probability row for each base model" as Oof
+    state "Training row of the refit base models" as Refit
+    state "Predicted once: base models, mean, stack" as Predicted
+    state "Counted in test metrics and group bootstrap" as Counted
+    [*] --> File
+    File --> DatasetError: cannot decode, or class folder missing
+    File --> Indexed: scan
+    Indexed --> Grouped: assign_groups, 8 hashes
+    Grouped --> Dev: holdout_split
+    Grouped --> Test: holdout_split
+    Dev --> Oof: kfold, held-out fold
+    Oof --> Refit: stacker fit on OOF rows
+    Test --> Predicted: single test pass
+    Predicted --> Counted: report.evaluate
+    Refit --> [*]
+    Counted --> [*]
+    DatasetError --> [*]
+```
 
 1. `scan` adds the image to the manifest with its class and SHA-256.
 2. `dedupe` computes 8 hashes and puts the image in a duplicate group and a split group.
@@ -222,11 +320,84 @@ flowchart TB
 6. A test image gets one prediction from each refit base model, the mean and the stacker.
 7. The report counts the image in the test metrics and in its group for the bootstrap.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as cellsight CLI
+    participant DS as dataset.py
+    participant DD as dedupe.py
+    participant ENS as ensemble.py
+    participant M as Base models
+    participant REP as report.py
+    participant FS as outputs and models
+
+    R->>CLI: cellsight evaluate --data-dir data/blood_cells
+    CLI->>CLI: Settings.from_env, CLI overrides
+    CLI->>DS: scan(data_dir, metadata.csv)
+    DS-->>CLI: Manifest and warnings
+    CLI->>DD: assign_groups(manifest, hash_distance)
+    DD-->>CLI: dup_group, split_group, summary
+    CLI->>ENS: run(manifest, names, settings)
+    ENS->>ENS: holdout_split, then kfold on development images
+    loop each fold and each base model
+        ENS->>M: fit on the other folds
+        M-->>ENS: predict_proba of the held-out fold
+    end
+    ENS->>ENS: Stacker.fit on the OOF probabilities
+    ENS->>M: refit on all development images
+    ENS->>M: predict_proba on the test images, one pass
+    ENS-->>CLI: EnsembleResult
+    CLI->>REP: evaluate, then write
+    REP->>FS: report.md, results.json
+    CLI->>FS: bundle .joblib with --save-model
+    CLI-->>R: test accuracy with CI, macro-F1, myeloblast recall
+```
+
 ---
 
 ## 5. The image index and the dedupe step
 
 **Purpose.** Make a validated index of the images, and find the copies of one cell before any split.
+
+The first diagram shows `dataset.scan`.
+
+```mermaid
+flowchart TD
+    IN[/"Image folder"/] --> DIR{"Is a folder?"}
+    DIR -- "no" --> ERR[/"DatasetError"/]
+    DIR -- "yes" --> CF{"All 5 class<br/>folders present?"}
+    CF -- "no" --> ERR
+    CF -- "yes" --> FILE["For each image file:<br/>PIL verify, SHA-256"]
+    FILE --> DEC{"Decodes, and each<br/>class has images?"}
+    DEC -- "no" --> ERR
+    DEC -- "yes" --> META{"metadata.csv given<br/>or in the folder?"}
+    META -- "yes" --> MAP["Map file to group,<br/>needs columns file, group"]
+    META -- "no" --> NOG["group empty"]
+    MAP --> WARN["Warnings: byte-identical copies,<br/>missing groups, class imbalance"]
+    NOG --> WARN
+    WARN --> OUT[/"Manifest: path, label,<br/>label_index, group, sha256"/]
+```
+
+The second diagram shows `dedupe.assign_groups`.
+
+```mermaid
+flowchart TD
+    IN[/"Manifest"/] --> GRAY["Grey 64 x 64 image"]
+    GRAY --> DIH["8 rotations and flips"]
+    DIH --> HASH["phash_bits for each:<br/>16 x 16 DCT block against its median"]
+    HASH --> DIST["Hamming distance: original hash<br/>against all 8 hashes of each image"]
+    DIST --> LINK{"Distance at most<br/>CELLSIGHT_HASH_DISTANCE?"}
+    LINK -- "yes" --> UF["Union-find link"]
+    LINK -- "no" --> NOL["No link"]
+    UF --> DUP["dup_group"]
+    NOL --> DUP
+    DUP --> SHA["Same SHA-256:<br/>same dup_group"]
+    SHA --> MERGE["Union-find of metadata groups<br/>and dup_groups"]
+    MERGE --> OUT[/"split_group and summary"/]
+```
 
 | Input | Output |
 |---|---|
@@ -254,6 +425,46 @@ flowchart TB
 ## 6. The base models
 
 **Purpose.** Give several independent probability estimates for each image.
+
+The first diagram shows a light model.
+
+```mermaid
+flowchart LR
+    P[/"Image paths and classes"/] --> FC{"Path in the<br/>FeatureCache?"}
+    FC -- "no" --> DEC["load_image at CELLSIGHT_IMAGE_SIZE,<br/>image_features: 108 values"]
+    DEC --> STORE["Keep the vector in the cache"]
+    FC -- "yes" --> SEL
+    STORE --> SEL{"Model"}
+    SEL -- "hist_logreg" --> C36["First 36 values"] --> LR["StandardScaler +<br/>LogisticRegression C 0.5"]
+    SEL -- "shape_rf" --> ALL["All 108 values"] --> RF["RandomForest,<br/>300 trees"]
+    SEL -- "thumb_knn" --> T64["Last 64 values"] --> KNN["StandardScaler +<br/>7-NN, distance weights"]
+    LR --> OUT[/"predict_proba: one column per class"/]
+    RF --> OUT
+    KNN --> OUT
+```
+
+The second diagram shows the inner validation split in `ensemble._fit` and the two-stage fine-tuning of a backbone in `deep.train_network`.
+
+```mermaid
+flowchart TD
+    IN[/"Training rows of one fold"/] --> VAL["holdout_split 15 %:<br/>inner validation part"]
+    VAL --> NET["build_network: timm model,<br/>data config of the backbone"]
+    NET --> EP{"Epoch below<br/>freeze_epochs 3?"}
+    EP -- "yes" --> FR["Frozen stage: backbone in eval mode,<br/>head only, AdamW lr 1e-3"]
+    EP -- "no" --> FULL["Full stage: all weights,<br/>AdamW lr 1e-4"]
+    FR --> AUG["Batches: preprocess with rotation, flip,<br/>brightness, contrast, stain jitter"]
+    FULL --> AUG
+    AUG --> VF["Validation macro-F1"]
+    VF --> BEST{"Better than<br/>the best epoch?"}
+    BEST -- "yes" --> COPY["Copy the weights"]
+    BEST -- "no" --> STALE{"4 epochs with no gain,<br/>or 20 epochs done?"}
+    COPY --> MAX{"20 epochs done?"}
+    MAX -- "no" --> EP
+    STALE -- "no" --> EP
+    MAX -- "yes" --> REST["Restore the best weights"]
+    STALE -- "yes" --> REST
+    REST --> OUT[/"TorchModel, .pt checkpoint"/]
+```
 
 | Input | Output |
 |---|---|
@@ -289,6 +500,40 @@ flowchart TB
 ## 7. Out-of-fold stacking and the explanations
 
 **Purpose.** Combine the base models without a look at the test set, and show where the evidence lies.
+
+The first diagram shows `ensemble.run`.
+
+```mermaid
+flowchart TD
+    IN[/"Manifest with split_group,<br/>model names"/] --> HAS{"split_group column?"}
+    HAS -- "no" --> ERR[/"ValueError: run assign_groups first"/]
+    HAS -- "yes" --> HS["holdout_split:<br/>development and test indices"]
+    HS --> KF["kfold: CELLSIGHT_FOLDS<br/>group-aware folds"]
+    KF --> FIT["Each fold, each model:<br/>fit on the other folds"]
+    FIT --> PR["predict_proba of the held-out fold"]
+    PR --> NAN{"Every development image<br/>has an OOF row?"}
+    NAN -- "no" --> RTE[/"RuntimeError"/]
+    NAN -- "yes" --> STK["Stacker.fit:<br/>log OOF probabilities"]
+    HS --> REF["Refit each model on<br/>all development images"]
+    REF --> TP["predict_proba on the test images,<br/>one pass"]
+    STK --> RES[/"EnsembleResult: OOF, test probabilities,<br/>stacker, base models"/]
+    TP --> RES
+```
+
+The second diagram shows `cellsight explain`.
+
+```mermaid
+flowchart LR
+    IMG[/"One image"/] --> LD["load_image at<br/>the bundle image size"]
+    LD --> P0["Bundle.predict_images:<br/>class and base log-probability"]
+    P0 --> OCC["occlusion_map: hide each 8 x 8 patch,<br/>stride 4, median colour"]
+    OCC --> DROP["Drop of the class log-probability<br/>for each pixel"]
+    LD --> MASK["cell_mask: colour against the border,<br/>closing, fill, central part"]
+    DROP --> FR["focus_ratio: evidence share in the mask<br/>divided by area share"]
+    MASK --> FR
+    DROP --> PNG[/"save_overlay: PNG"/]
+    FR --> OUT[/"focus ratio, above 1 = on the cell"/]
+```
 
 | Input | Output |
 |---|---|
@@ -332,6 +577,35 @@ flowchart TB
 | Stacker | Multinomial logistic regression, C = 1.0, on log-probabilities clipped at 1e-6 |
 | Hash distance | `CELLSIGHT_HASH_DISTANCE` bits of 256 (default 16) |
 | Too few groups | `SplitError` with a clear message |
+
+The first diagram shows the group-aware splits in `splits.py`.
+
+```mermaid
+flowchart TD
+    IN[/"Classes and split groups"/] --> N{"Number of groups at least<br/>the number of folds?"}
+    N -- "no" --> SE[/"SplitError"/]
+    N -- "yes" --> SGK["StratifiedGroupKFold,<br/>shuffle, seed"]
+    SGK --> HO["holdout_split: first fold of<br/>round(1 / test fraction) folds"]
+    SGK --> KF["kfold: CELLSIGHT_FOLDS folds"]
+    HO --> DIS{"assert_disjoint:<br/>a group on both sides?"}
+    KF --> DIS
+    DIS -- "yes" --> SE
+    DIS -- "no" --> OUT[/"Index pairs"/]
+```
+
+The second diagram shows how `report.evaluate` gets the test metrics and the confidence intervals.
+
+```mermaid
+flowchart TD
+    TP[/"Test probabilities<br/>of each base model"/] --> CAND["Candidates: each base model,<br/>mean, stack"]
+    CAND --> PM["point_metrics: accuracy, macro-F1,<br/>critical recall, AUC, ECE, log loss"]
+    CAND --> BS["bootstrap: resample whole split groups,<br/>CELLSIGHT_BOOTSTRAP times"]
+    BS --> Q["2.5 % and 97.5 % quantiles"]
+    PM --> REC[/"results.json and report.md"/]
+    Q --> REC
+    CAND --> PC["stack: per-class recall,<br/>confusion matrix"]
+    PC --> REC
+```
 
 ---
 
@@ -409,6 +683,26 @@ pytest -q
 
 The commands with `--data-dir` also accept `--metadata`, `--no-metadata`, `--seed`, `--hash-distance`, `--test-fraction`, `--folds`, `--bootstrap` and `--device`.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    SYN["cellsight synth"] --> IMG[("image folder<br/>+ metadata.csv")]
+    DL[/"Public dataset,<br/>see data/README.md"/] --> IMG
+    IMG --> IDX["cellsight index"]
+    IMG --> DD["cellsight dedupe"]
+    DD --> GRP[("groups CSV, --out")]
+    IMG --> EV["cellsight evaluate"]
+    EV --> REP[("outputs/report.md<br/>outputs/results.json")]
+    EV -- "--save-model" --> BUN[("models/light.joblib")]
+    IMG --> TD["cellsight train-deep"]
+    TD --> PT[("models/backbone.pt")]
+    BUN --> PRD["cellsight predict"]
+    BUN --> EXP["cellsight explain"]
+    EXP --> PNG[("outputs/cell1.png")]
+    DEMO["cellsight demo:<br/>synth, then evaluate"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -425,6 +719,18 @@ The commands with `--data-dir` also accept `--metadata`, `--no-metadata`, `--see
 | `CELLSIGHT_DEVICE` | backbones | `auto`, `cpu` or `cuda` (default `auto`) |
 
 cellsight uses no credentials. A local `.env` file is optional, and git ignores it.
+
+```mermaid
+flowchart LR
+    ENV[/".env file, optional"/] --> FE["Settings.from_env"]
+    PENV[/"Process environment<br/>wins over .env"/] --> FE
+    FE --> CHK{"Each number in its range?"}
+    CHK -- "no" --> ERR[/"ConfigError: the CLI prints<br/>error: and returns 2"/]
+    CHK -- "yes" --> OVR["with_overrides:<br/>CLI options win"]
+    OVR --> POST{"__post_init__ checks:<br/>test fraction, folds, hash distance"}
+    POST -- "no" --> ERR
+    POST -- "yes" --> SET[/"Settings"/]
+```
 
 ---
 
